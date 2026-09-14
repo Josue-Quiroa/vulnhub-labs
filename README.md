@@ -6,7 +6,7 @@ Notas reorganizadas a partir de un export sucio de Joplin. El objetivo no es un 
 | --- | --- | --- | --- |
 | [SickOs 1.1](labs/sickos-1.1.md) | SickOs | Squid → WolfCMS (upload autenticado) | Cron `connect.py` writable / reutilización de password SQL |
 | [Raven 2](labs/raven-2.md) | Raven | PHPMailer CVE-2016-10033 | MySQL `FILE` + UDF |
-| [Symfonos 3](labs/symfonos-3.md) | Symfonos | CGI + Shellshock | Grupo `pcap` → sniff loopback → `hades` |
+| [Symfonos 3](labs/symfonos-3.md) | Symfonos | CGI + Shellshock | `pcap` → sniff loopback → `hades` → grupo `gods` + Python `sitecustomize` |
 
 Fuente original: VulnHub. Entorno de laboratorio. No hay sistemas de producción involucrados.
 
@@ -25,5 +25,5 @@ Las capturas de Joplin (`_resources/*.png`) no viajaron con el texto. Cuando se 
 ## Convención
 
 - Un `.md` por máquina.
-- Sin payloads listos para disparar. Si hace falta ilustrar un mecanismo, se describe el contrato que se abusó (header CGI, argumento de `sendmail`, privilegio `FILE` de MySQL, bit de grupo `pcap`).
+- Sin payloads listos para disparar. Si hace falta ilustrar un mecanismo, se describe el contrato que se abusó (header CGI, argumento de `sendmail`, privilegio `FILE` de MySQL, bit de grupo `pcap`, hook `sitecustomize` de Python).
 - Credenciales de laboratorio se mencionan porque el box las pone a propósito. No reutilizar ese hábito en un engagement real.
