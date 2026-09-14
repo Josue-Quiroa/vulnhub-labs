@@ -69,48 +69,118 @@ El secreto del DSN (usuario/password de MySQL en `config.php`) sí se anotó com
 
 - `secure_file_priv = NULL` (o vacío, según versión) **no** significa automáticamente “sin FILE”. Significa “no hay jaula de directorio para `LOAD_FILE`/`INTO DUMPFILE`”.
 - Lo que mata un UDF es otra terna: privilegio `FILE`, `plugin_dir` escribible por el uid de `mysqld`, y que el server acepte `CREATE FUNCTION ... SONAME`.
-- En este box el UDF **no** era el camino que usaste. Correcto: no fuerces MySQL si el cron ya te da un writer controlado por root.
+- En este box el UDF **no** era el camino que usaste. Correcto: no fuerces MySQL si el cron ya te da un writer controlado por root. Quedó un artefacto de ensayo (`/tmp/raptor_udf2.so`) que no escala: `mysqld` corre como usuario `mysql`, no como root.
 
-## Privilegio: dos caminos, uno usado
+## Privilegio: dos caminos, ambos cerrados
 
-Hay que separar *qué se usó* de *qué se confirmó después*.
+Hay que separar *identidad* (PAM / grupo `sudo`) de *código* (cron que ejecuta un artefacto que tú escribes). Los dos funcionan en esta caja y no se necesitan entre sí.
 
-### Path usado: cron + archivo que root ejecuta
+### Path A — reutilización de secreto + grupo `sudo`
 
-LSE marca un cron bajo `/etc/cron.d/automate` (o equivalente) que dispara un `connect.py`.
-
-Aquí el bug no es “hay un cron”. Casi todo Linux tiene cron. El bug es la **intersección**:
-
-- El *principal* que ejecuta el job es root (o un uid distinto al tuyo).
-- El *objeto* (`connect.py`) es escribible por `www-data`.
-
-Eso es un fallo de DAC. Root va a `exec` un archivo cuyo contenido lo decide otro uid. No hace falta un exploit de kernel. El scheduler es un invocador privilegiado de código no privilegiado.
-
-Decidiste no poner una reverse shell en el script y en su lugar añadir tu usuario a sudoers. Conceptualmente es lo mismo: estás inyectando un cambio de política en un contexto root. La diferencia operativa es persistencia vs. callback. En un lab da igual; en un engagement, escribir `/etc/sudoers` deja un artefacto más ruidoso y más estable que un one-shot.
-
-`sudo su` después solo confirma que la política nueva ya está cargada.
-
-### Path confirmado después: reutilización de secreto
-
-`/etc/passwd` lista el usuario `sickos` con shell. El password del DSN de MySQL (el de `config.php`) sirve para esa cuenta de sistema. El acceso puede ser `su` desde `www-data` o `ssh` contra el `sshd` ya visto; el plano que se rompe es el mismo.
+`/etc/passwd` lista `sickos` con shell. El password del DSN de MySQL (el de `config.php`) sirve para esa cuenta de sistema. El acceso puede ser `su` desde `www-data` o `ssh` contra el `sshd` ya visto; el plano que se rompe es el mismo.
 
 Esto no es una vulnerabilidad de MySQL. Es **password reuse** entre:
 
 - secreto de servicio (DB),
 - cuenta local.
 
-El proceso de instalación o el autor del lab usó el mismo material en dos stores que no deberían compartir destino. Una vez tienes el secreto del worker, pruebas el mismo material contra `su`/`ssh`. Barato, y muy frecuente.
+En Precise, el paquete `sudo` mete a `sickos` en el grupo `sudo` con la regla típica `%sudo ALL=(ALL:ALL) ALL`. No hay `NOPASSWD`: LSE marca *sudo without password = nope* y *sudo with password = yes*. La diferencia es `sudo -n` (falla sin ticket) frente a `sudo` + PAM (`pam_unix` contra `/etc/shadow`).
 
-En muchos writeups de este box, `sickos` ya tiene sudo amplio sin tocar sudoers. Aquí el root *operativo* fue el cron que escribe política; el reuso de password es el atajo que se verificó después, no el que abrió la sesión inicial.
+Una vez autenticado como `sickos`, `sudo` es SUID root: valida el caller, hace `setuid(0)` y `execve` del comando. LSE llegó a imprimir `uid=0(root)` en el check `sud020`. Eso no es “casi root”: es root en ese proceso.
+
+`PermitRootLogin yes` solo importa si aparece un secreto de *root*. Aquí no hizo falta: el grupo `sudo` ya delega.
+
+### Path B — cron + archivo que root ejecuta
+
+LSE marca `/etc/cron.d/automate`:
+
+```text
+* * * * * root /usr/bin/python /var/www/connect.py
+```
+
+Cinco asteriscos = máscara que coincide **cada minuto**. Resolución de Vixie cron: 60 s. El sexto token en `/etc/cron.d/` es el usuario efectivo (`root`). El fichero de política es `root:root` y no se toca.
+
+El bug no es “hay un cron”. Casi todo Linux tiene cron. El bug es la **intersección**:
+
+- El *principal* que ejecuta el job es root.
+- El *objeto* (`/var/www/connect.py`) es escribible por `www-data`.
+
+Eso es un fallo de DAC / *confused deputy*. Root hace `execve` de un archivo cuyo contenido lo decide otro uid. No hace falta un exploit de kernel.
+
+#### Qué clase de abuso de cron es (y cuáles no)
+
+| Clase | Qué controlas | ¿SickOs? |
+| --- | --- | --- |
+| Overwrite del script | El fichero que el job ejecuta | **Sí**: `connect.py` |
+| PATH hijack | Dir escribible *antes* en el `PATH` de cron y comando **sin** ruta absoluta | No: el job usa `/usr/bin/python` + ruta absoluta |
+| Wildcard (`tar *`) | Nombres de fichero que el binario interpreta como flags | No |
+| Escribes `/etc/cron.d` | La política | No: `automate` es 644 root |
+
+Write-ups de “tar checkpoint” o `PATH=/home/user` no describen esta máquina.
+
+#### Anatomía de un tick (lo que LSE cazó en `ps`)
+
+```text
+cron (uid 0, daemon)
+  └─ CRON
+       └─ /bin/sh -c "/usr/bin/python /var/www/connect.py"
+            └─ /usr/bin/python /var/www/connect.py    uid 0
+```
+
+El entorno **no** es tu shell de `www-data`:
+
+- sin TTY
+- `PATH` corto (`/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin`)
+- `HOME=/root`, `SHELL=/bin/sh`
+- no hereda variables de Apache
+
+Si el script termina, euid 0 desaparece. Si bloquea (socket, loop), al minuto siguiente nace **otra** instancia. Por eso un callback persistente apila procesos root.
+
+#### El runtime lo fija el `execve`, no el shebang
+
+`/usr/bin/python` en Precise es un symlink a **python2.7**. Cron nombra el intérprete en la línea del job; el `#!/usr/bin/python` del fichero es cosmética.
+
+Error real de laboratorio: meter un one-liner pensado para Py3 (f-strings, walrus, o peor: pegar `bash -i >& /dev/tcp/...` *dentro* de un `.py`). El lexer de 2.7 suelta `SyntaxError` y el job muere en milisegundos. No hay prompt. El traceback va a syslog (`CRON[...]`), no a tu TTY.
+
+Superficie 2.7 que sí parsea: `str.format()`, `with open(...)`, `0o440` (2.6+).
+
+Antes de esperar el tick:
+
+- compilar con **el mismo binario** que cron usa (`/usr/bin/python -m py_compile /var/www/connect.py`);
+- si “no pasa nada”, mirar `/var/log/syslog` líneas `CRON`, no el shell actual.
+
+#### Qué se inyectó (mutación de política, no reverse)
+
+En lugar de una sesión, el script —ya como root en el tick— escribe un drop-in en `/etc/sudoers.d/` para `www-data` con `NOPASSWD` y fija modo `0440`.
+
+Contrato que hay que respetar:
+
+- `#includedir /etc/sudoers.d` **ignora** ficheros con `.` en el nombre (`foo.bak`). Un guión (`www-data`) vale.
+- `sudo` **descarta** el drop-in si el modo es world-writable. `0440` no es adorno: es lo que hace que la regla exista para `sudo`.
+- Owner acaba `root:root` porque quien hace el `open()` es el proceso del cron, no `www-data`.
+
+Después del tick el flujo ya no es cron: `sudo` SUID lee la política nueva y PAM no pide password a `www-data`. Mismo destino (`euid=0`), huella distinta al path A.
+
+En un engagement escribir `sudoers.d` es artefacto estable y ruidoso. En el lab sirve para demostrar uid 0 **sin** listener y **sin** pillar el PID del python.
 
 ## Callejones y notas
 
 - Tratar `:3128` como sitio web: solo el error page de Squid. Cerrado como origen.
 - `8080/tcp closed` desde el atacante: no es evidencia de que no haya HTTP interno.
-- CGI `/cgi-bin/status` / Shellshock: superficie plausible en Precise; no fue el foothold de estas notas.
-- UDF MySQL: descartado a propósito; el cron ya era writer root.
+- CGI `/cgi-bin/status` / Shellshock: superficie plausible en Precise; no fue el foothold de estas notas. Escribible por `www-data` = persistencia web, no privesc.
+- UDF MySQL: descartado a propósito; el cron ya era writer root. Además `mysqld` no es uid 0.
+- Kernel `3.11.0-15-generic` / Dirty COW y familia: reserva. Hay `gcc` en el box. No era el fallo que el autor plantó.
 - El panel admin se descubre por un txt en `/docs`, no por “intuición CMS”. Los leftovers de documentación son superficie.
+- `umask 0000` de la sesión `www-data` solo afecta ficheros *nuevos*. Un overwrite in-place conserva el modo del inode original.
 - Las imágenes originales de Joplin y el `-oN` del Nmap no están en este repo. Cuando se reexporten: `labs/sickos-1.1/img/` y el scan junto a la tabla de puertos.
+
+## Lectura (mecanismo, no receta)
+
+- [crontab(5)](https://man7.org/linux/man-pages/man5/crontab.5.html) — cinco campos + user en `/etc/cron.d`.
+- [HackTricks — Linux PE](https://book.hacktricks.wiki/en/linux-hardening/privilege-escalation/index.html) — sección scheduled/cron; quedarse en *writable script*, ignorar PATH/wildcard en la primera pasada.
+- [PayloadsAllTheThings — Linux PE](https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/Methodology%20and%20Resources/Linux%20-%20Privilege%20Escalation.md) — checklist de enumeración.
+- [pspy](https://github.com/DominicBreuker/pspy) — ver el tick `CRON` → `python` sin ser root.
+- MITRE [T1053.003](https://attack.mitre.org/techniques/T1053/003/).
 
 ## Qué deberías poder explicar sin mirar el writeup
 
@@ -119,5 +189,8 @@ En muchos writeups de este box, `sickos` ya tiene sudo amplio sin tocar sudoers.
 - Por qué un file manager autenticado + document root = RCE, aunque no haya CVE con logo.
 - Por qué CGI + Bash de Precise es otra hipótesis distinta (y por qué aquí no se usó).
 - Por qué un cron no es privesc hasta que el archivo ejecutado es writable por un uid inferior.
+- Por qué esta caja es *overwrite de script* y no PATH hijack ni wildcard.
+- Por qué el runtime es Python 2.7 aunque el shebang “diga otra cosa”, y dónde se ve un `SyntaxError` de cron.
+- Por qué un drop-in en `sudoers.d` con modo distinto de `0440` “no existe” para `sudo`.
 - Por qué `secure_file_priv` no es el único bit que decide un UDF.
 - Por qué reusar el secreto del DSN contra `sickos` no es un bug de MySQL.
