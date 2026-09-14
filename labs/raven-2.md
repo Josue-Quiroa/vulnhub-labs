@@ -5,30 +5,30 @@ Notas origen: `Escanning.md`, `Wordpress.md`, `Priv escalation.md` (UDF), `SSH.m
 
 ## Superficie
 
-Puertos relevantes en tus notas: HTTP/80 (Apache 2.4.10 Debian), SSH, `rpcbind`.
+Puertos relevantes: HTTP/80 (Apache 2.4.10 Debian), SSH, `rpcbind`.
 
-`rpcbind` en un box Linux de este perfil casi nunca es el foothold. Es el mapper de RPC (port 111). Sin un servicio NFS/mountd expuesto de forma útil, enumerarlo y cerrar el ticket es la decisión correcta. Lo dejaste como negativo. Bien.
+`rpcbind` en un box Linux de este perfil casi nunca es el foothold. Es el mapper de RPC (port 111). Sin un servicio NFS/mountd expuesto de forma útil, enumerarlo y cerrar el ticket es la decisión correcta. Se cerró como negativo.
 
 HTTP sí importa. El fuzzing saca `/wordpress` y `/vendor`. Esos dos directorios no pesan igual:
 
 - `/wordpress` es una app con su propio plano de identidad (wp-login, XML-RPC, usuarios en `wp_users`).
-- `/vendor` es *dependencia empaquetada*. En PHP, `vendor/` suele ser Composer o un third-party drop. Ahí no buscas un login: buscas `VERSION`, `README`, `CHANGELOG`. La versión es el input de la hipótesis CVE.
+- `/vendor` es *dependencia empaquetada*. En PHP, `vendor/` suele ser Composer o un third-party drop. Ahí no se busca un login: se busca `VERSION`, `README`, `CHANGELOG`. La versión es el input de la hipótesis CVE.
 
 SSH: banner viejo. Más abajo.
 
-## XML-RPC: superficie que no explotaste (y está bien)
+## XML-RPC: superficie que no pagó
 
-Pegaste `system.listMethods` sobre `xmlrpc.php`. Eso no es “el protocolo WordPress”. Es XML-RPC: un bus de procedimientos sobre HTTP, heredado de Blogger/metaWeblog/MovableType, que WP sigue exponiendo.
+Se listó `system.listMethods` sobre `xmlrpc.php`. Eso no es “el protocolo WordPress”. Es XML-RPC: un bus de procedimientos sobre HTTP, heredado de Blogger/metaWeblog/MovableType, que WP sigue exponiendo.
 
-Lo que `listMethods` te dice:
+Lo que `listMethods` muestra:
 
 - El endpoint está vivo (200 + `methodResponse`).
 - Hay métodos de lectura y de escritura (`wp.newPost`, `wp.uploadFile`, `wp.getUsers`, pingback, etc.).
 - `demo.sayHello` / `demo.addTwoNumbers` son probes de liveness, no de auth.
 
-Intentaste usarlo como canal de enumeración o de SSRF (`pingback.ping` hacia tu máquina). Mismo *faultCode*, mismo timing, sin callback. Conclusión válida: **el método existe, la precondición no**. Pingback necesita que el servidor pueda iniciar HTTP saliente y que el filtro de destino no lo corte. Si no hay diferencia de tiempo ni paquete de vuelta, no sigas golpeando el mismo método.
+Se intentó usarlo como canal de enumeración o de SSRF (`pingback.ping` hacia la máquina del atacante). Mismo *faultCode*, mismo timing, sin callback. Conclusión válida: **el método existe, la precondición no**. Pingback necesita que el servidor pueda iniciar HTTP saliente y que el filtro de destino no lo corte. Si no hay diferencia de tiempo ni paquete de vuelta, no tiene sentido seguir golpeando el mismo método.
 
-XML-RPC *sí* puede ser vector (auth brute sobre `wp.getUsers`/`system.multicall`, upload autenticado, SSRF histórico). Aquí no lo fue. El writeup debe registrar el negativo para no reabrir el pozo.
+XML-RPC *sí* puede ser vector (auth brute sobre `wp.getUsers`/`system.multicall`, upload autenticado, SSRF histórico). Aquí no lo fue. Queda registrado como negativo para no reabrir el pozo.
 
 ## Foothold: PHPMailer en `/vendor`
 
@@ -39,7 +39,7 @@ Modelo mental:
 1. La app construye un correo y pasa el remitente a `mail()` / a un binario `sendmail -t`.
 2. El campo `From` (o equivalente) llega a argv del transportista **sin aislarse**.
 3. `sendmail` de GNU/Postfix interpreta switches como `-X` (log file) u `-OQueueDirectory=`.
-4. Si controlas el `From`, controlas *dónde* sendmail escribe y *qué* escribe. El payload no es un webshell mágico: es un archivo que el transportista materializa bajo el document root porque le diste la ruta con `-X`.
+4. Si se controla el `From`, se controla *dónde* sendmail escribe y *qué* escribe. El resultado no es un webshell mágico: es un archivo que el transportista materializa bajo el document root porque recibió la ruta con `-X`.
 
 Precondiciones reales:
 
@@ -53,15 +53,15 @@ Identidad: `www-data`. Otra vez el uid del SAPI, no un usuario de negocio.
 
 Banner OpenSSH viejo → hipótesis de *user enum* por diferencia de respuesta en el protocolo de autenticación (timing / mensaje). `scanner/ssh/ssh_enumusers` no “adivina usuarios”: habla el handshake SSH y mide si el servidor corta distinto ante un principal existente vs. inexistente.
 
-En versiones parcheadas esa diferencia desaparece. Tus notas: la lista corta confirma que *el scanner corre*; la lista larga + brute no saca secretos. El brute force contra SSH en lab es ruido útil para aprender rate-limit; en real es el camino más corto a lockout y a un ticket de IR.
+En versiones parcheadas esa diferencia desaparece. La lista corta confirma que *el scanner corre*; la lista larga + brute no saca secretos. El brute force contra SSH en lab enseña rate-limit; en real es el camino más corto a lockout y a un ticket de IR.
 
-Deja SSH como callejón. El foothold ya estaba en HTTP.
+SSH queda como callejón. El foothold ya estaba en HTTP.
 
 ## Privilegio: tres planos, no un salto
 
 `www-data` ≠ `root@localhost` (cuenta MySQL) ≠ UID 0 del proceso `mysqld`. Mezclarlos es el error que hace parecer “magia” a la UDF.
 
-El worker lee el DSN de la app. Eso te hace **cliente SQL**, no root del OS. En esta instancia la cuenta mapeada fue `root@localhost` con `GRANT ALL ON *.*`. Sigue sin ser UID 0 hasta que el daemon cargue código nativo.
+El worker lee el DSN de la app. Eso da un **cliente SQL**, no root del OS. En esta instancia la cuenta mapeada fue `root@localhost` con `GRANT ALL ON *.*`. Sigue sin ser UID 0 hasta que el daemon cargue código nativo.
 
 El LSE ya había contestado el plano del proceso: `mysqld` arrancaba con `--user=root` y `--plugin-dir=/usr/lib/mysql/plugin`. Eso es dato de *deployment*, no de la UDF en abstracto.
 
@@ -69,7 +69,7 @@ El LSE ya había contestado el plano del proceso: `mysqld` arrancaba con `--user
 
 | Pregunta | Valor en esta instancia | Por qué existe |
 | --- | --- | --- |
-| `USER()` vs `CURRENT_USER()` | ambos `root@localhost` | Uno es lo que enviaste; el otro es la cuenta con la que el server te mapeó (`user@host`). El grant set cuelga de `CURRENT_USER()`. |
+| `USER()` vs `CURRENT_USER()` | ambos `root@localhost` | Uno es lo que se envió; el otro es la cuenta con la que el server mapeó (`user@host`). El grant set cuelga de `CURRENT_USER()`. |
 | `@@version` | `5.5.60-0+deb8u1` | Rama 5.5: `SONAME` solo se busca en `plugin_dir`; filtro de símbolos auxiliares activo por defecto. |
 | `SHOW GRANTS` | `ALL ON *.*` + `WITH GRANT OPTION` | Privilegio efectivo. Aquí incluye `FILE` e `INSERT` sobre `mysql` (registrar en `mysql.func`). |
 | `plugin_dir` | `/usr/lib/mysql/plugin/` | Único sitio de donde 5.5 hace `dlopen` de una UDF. |
@@ -77,11 +77,11 @@ El LSE ya había contestado el plano del proceso: `mysqld` arrancaba con `--user
 | `max_allowed_packet` | `16777216` | Un `.so` no entra si el paquete es más chico que el blob. |
 | `file_priv` / `super_priv` en `mysql.user` | `Y`/`Y` en `root@localhost`, `root@raven`, `root@127.0.0.1`, `root@::1`, `debian-sys-maint@localhost` | Confirmación por fila, no solo por el texto de `GRANT`. |
 
-`debian-sys-maint` es la cuenta de mantenimiento de Debian para arrancar/parar MySQL. No aporta más poder del que ya tenías como `root@localhost`.
+`debian-sys-maint` es la cuenta de mantenimiento de Debian para arrancar/parar MySQL. No aporta más poder del que ya daba `root@localhost`.
 
 ### `LOAD_FILE` no es un `open()` del UID de `mysqld`
 
-Como `www-data` no podías ni hacer `stat` de `/root/.bashrc` (`/root` suele ser `0700`) ni leer `/etc/shadow` (`0640` `root:shadow`).
+Como `www-data` no se podía ni hacer `stat` de `/root/.bashrc` (`/root` suele ser `0700`) ni leer `/etc/shadow` (`0640` `root:shadow`).
 
 Como cliente SQL:
 
@@ -118,7 +118,7 @@ UDF es el mecanismo *oficial* de MySQL para cargar una shared object y exponerla
 | Depósito | el `.so` vive **solo** en `plugin_dir`. `SONAME` es el basename, no un path absoluto. Destino de `DUMPFILE` no puede existir. |
 | Registro | `CREATE FUNCTION` hace `INSERT` en `mysql.func` + `dlopen`. Hasta que `SELECT * FROM mysql.func` muestre la fila, no hay salto de UID. |
 
-Si `mysqld` corriera como `mysql`, la misma cadena te dejaría como `mysql`. Aquí el deployment era root; por eso leer `/root/.bashrc` y el callback posterior cuadran.
+Si `mysqld` corriera como `mysql`, la misma cadena dejaría al atacante como `mysql`. Aquí el deployment era root; por eso leer `/root/.bashrc` y el callback posterior cuadran.
 
 ## Callejones
 
@@ -128,12 +128,3 @@ Si `mysqld` corriera como `mysql`, la misma cadena te dejaría como `mysql`. Aqu
 - PHP vía `INTO OUTFILE` al docroot: sigue siendo `www-data`; `0666` además invalida cron/sshd/sudoers.
 - `LOAD_FILE('/etc/shadow')`: filtro `o+r` de MySQL, no contradicción con un daemon UID 0 ni con la UDF posterior.
 - `.so` de 0 bytes en `plugin_dir`: transporte (`OUTFILE` / `LOAD_FILE` de un objeto sin `o+r`), no “UDF rota”.
-
-## Qué deberías poder explicar sin mirar el writeup
-
-- Diferencia entre “hay XML-RPC” y “XML-RPC es explotable ahora”.
-- Por qué CVE-2016-10033 vive en argv de sendmail y no en el parser MIME de PHP.
-- Por qué `root@mysql` no es UID 0 hasta el `dlopen`.
-- Por qué `LOAD_FILE('/root/.bashrc')` puede funcionar y `LOAD_FILE('/etc/shadow')` devolver `NULL` en el mismo proceso root.
-- Por qué vacío ≠ `NULL` en `secure_file_priv`.
-- Por qué un PHP `0666` en el docroot no es privilegio y por qué `DUMPFILE` no es `OUTFILE`.

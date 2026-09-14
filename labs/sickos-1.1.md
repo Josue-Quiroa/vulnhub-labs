@@ -18,7 +18,7 @@ MAC VMware: es una VM de laboratorio, no un dato de explotación.
 
 Squid en este box no es “un puerto más”. Es un *forward proxy* que el propio host usa como filtro de acceso al origen HTTP. Sin hablarle al proxy, el origen parece muerto o vacío. Con el proxy, el mismo request revela el sitio real, `robots.txt` y `/wolfcms`.
 
-Eso no es magia de la herramienta: el cliente HTTP cambia el request-line. En modo proxy el browser/ffuf envía `GET http://<origen>/ruta HTTP/1.1` al listener de Squid; Squid abre la conexión al origen. Si enumeras como si 80/3128 fueran un vhost directo, estás midiendo el *error page* del proxy, no la app.
+Eso no es magia de la herramienta: el cliente HTTP cambia el request-line. En modo proxy el browser/ffuf envía `GET http://<origen>/ruta HTTP/1.1` al listener de Squid; Squid abre la conexión al origen. Si se enumera como si 80/3128 fueran un vhost directo, se mide el *error page* del proxy, no la app.
 
 Negativos de primer contacto (fáciles de olvidar la primera vez que se ve un proxy):
 
@@ -28,17 +28,17 @@ Negativos de primer contacto (fáciles de olvidar la primera vez que se ve un pr
 
 Detrás del proxy el origen es el stack de Precise: Apache 2.2.x + PHP 5.3.x. Esas versiones no se leen en el scan de 3128; aparecen en los headers del origen cuando el request va *vía* Squid.
 
-Hallazgos de enumeración (según tus notas, siempre con el proxy en el medio):
+Hallazgos de enumeración (siempre con el proxy en el medio):
 
 - `robots.txt` permitido a través del proxy.
 - `/wolfcms` alcanzable.
-- Fuzzing → `/docs/` con un txt que filtra versión (en tus notas, `3800.txt` / exception).
+- Fuzzing → `/docs/` con un txt que filtra versión (`3800.txt` / exception).
 - Panel admin de WolfCMS.
 - Superficie CGI típica de este box (`/cgi-bin/status`) **no** fue el path usado. Queda como hipótesis de Precise + Bash viejo (Shellshock) que no se persiguió aquí. Distinta de “file manager autenticado”: no pide login del CMS; pide que el worker CGI herede variables de entorno hacia Bash.
 
 SSH está abierto. En este path no fue el foothold. El usuario de sistema `sickos` sí existe; el acceso interactivo llegó después, por reutilización de secreto, no por el banner de `sshd`.
 
-## Hipótesis de foothold
+## Foothold: WolfCMS
 
 WolfCMS viejo + panel de archivos. La pregunta no es “¿hay un exploit de file upload?”. La pregunta es:
 
@@ -46,11 +46,11 @@ WolfCMS viejo + panel de archivos. La pregunta no es “¿hay un exploit de file
 
 Condiciones que tenían que cumplirse:
 
-1. Credencial válida en el panel. `admin:admin` no es “suerte”: es default de instalación que nadie rotó. El login solo demuestra que el *password store* del CMS no se endureció.
+1. Credencial válida en el panel. `admin:admin` no es “suerte”: es default de instalación que nadie rotó. El login demuestra que el *password store* del CMS no se endureció.
 2. El plugin/file manager no separa *store* de *execute*. Subir a `/wolfcms/public` implica que esa ruta es web-accesible y que el handler PHP no está restringido por extensión/content-type de forma efectiva.
-3. El worker del web server corre el intérprete sobre lo que acabas de escribir.
+3. El worker del web server corre el intérprete sobre lo que se acaba de escribir.
 
-El RCE no vive en “el upload”. Vive en **escribir bytecode/script en un path que el SAPI de PHP va a incluir**. El upload solo es el canal de escritura autenticado.
+El RCE no vive en “el upload”. Vive en **escribir un script en un path que el SAPI de PHP va a incluir**. El upload solo es el canal de escritura autenticado.
 
 Identidad obtenida: `www-data` (contexto del vhost). No es un usuario de sistema interactivo; es la cuenta del worker. Por eso el TTY hay que construirlo después: no hay sesión login(1), hay un proceso hijo de Apache.
 
@@ -61,19 +61,19 @@ Identidad obtenida: `www-data` (contexto del vhost). No es un usuario de sistema
 De la base `wolf`:
 
 - Tabla `users` con hashes.
-- El hash del admin del CMS cae a `admin` — coherente con el login que ya tenías. No es un hallazgo nuevo de identidad; es confirmación de que el password store del CMS y el de la app coinciden en mediocridad.
+- El hash del admin del CMS cae a `admin` — coherente con el login que ya se tenía. No es un hallazgo nuevo de identidad; es confirmación de que el password store del CMS y el de la app coinciden en mediocridad.
 
 El secreto del DSN (usuario/password de MySQL en `config.php`) sí se anotó como material reutilizable. El valor en claro no se deja aquí a propósito; el hecho útil es que **el mismo secreto alimenta dos stores** (servicio SQL y cuenta local `sickos`).
 
-`@@secure_file_priv` en `NULL` lo interpretaste como “no puedo hacer UDF / no puedo escribir”. Cuidado con esa lectura:
+`@@secure_file_priv` en `NULL` es fácil interpretarlo como “no se puede hacer UDF / no se puede escribir”. Esa lectura es incorrecta:
 
 - `secure_file_priv = NULL` (o vacío, según versión) **no** significa automáticamente “sin FILE”. Significa “no hay jaula de directorio para `LOAD_FILE`/`INTO DUMPFILE`”.
 - Lo que mata un UDF es otra terna: privilegio `FILE`, `plugin_dir` escribible por el uid de `mysqld`, y que el server acepte `CREATE FUNCTION ... SONAME`.
-- En este box el UDF **no** era el camino que usaste. Correcto: no fuerces MySQL si el cron ya te da un writer controlado por root. Quedó un artefacto de ensayo (`/tmp/raptor_udf2.so`) que no escala: `mysqld` corre como usuario `mysql`, no como root.
+- En este box el UDF **no** era el camino usado. Correcto: no forzar MySQL si el cron ya da un writer controlado por root. Quedó un artefacto de ensayo (`/tmp/raptor_udf2.so`) que no escala: `mysqld` corre como usuario `mysql`, no como root.
 
 ## Privilegio: dos caminos, ambos cerrados
 
-Hay que separar *identidad* (PAM / grupo `sudo`) de *código* (cron que ejecuta un artefacto que tú escribes). Los dos funcionan en esta caja y no se necesitan entre sí.
+Hay que separar *identidad* (PAM / grupo `sudo`) de *código* (cron que ejecuta un artefacto escribible). Los dos funcionan en esta caja y no se necesitan entre sí.
 
 ### Path A — reutilización de secreto + grupo `sudo`
 
@@ -127,7 +127,7 @@ cron (uid 0, daemon)
             └─ /usr/bin/python /var/www/connect.py    uid 0
 ```
 
-El entorno **no** es tu shell de `www-data`:
+El entorno **no** es la shell de `www-data`:
 
 - sin TTY
 - `PATH` corto (`/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin`)
@@ -140,7 +140,7 @@ Si el script termina, euid 0 desaparece. Si bloquea (socket, loop), al minuto si
 
 `/usr/bin/python` en Precise es un symlink a **python2.7**. Cron nombra el intérprete en la línea del job; el `#!/usr/bin/python` del fichero es cosmética.
 
-Error real de laboratorio: meter un one-liner pensado para Py3 (f-strings, walrus, o peor: pegar `bash -i >& /dev/tcp/...` *dentro* de un `.py`). El lexer de 2.7 suelta `SyntaxError` y el job muere en milisegundos. No hay prompt. El traceback va a syslog (`CRON[...]`), no a tu TTY.
+Error real de laboratorio: meter un one-liner pensado para Py3 (f-strings, walrus, o peor: pegar `bash -i >& /dev/tcp/...` *dentro* de un `.py`). El lexer de 2.7 suelta `SyntaxError` y el job muere en milisegundos. No hay prompt. El traceback va a syslog (`CRON[...]`), no a la TTY.
 
 Superficie 2.7 que sí parsea: `str.format()`, `with open(...)`, `0o440` (2.6+).
 
@@ -163,34 +163,12 @@ Después del tick el flujo ya no es cron: `sudo` SUID lee la política nueva y P
 
 En un engagement escribir `sudoers.d` es artefacto estable y ruidoso. En el lab sirve para demostrar uid 0 **sin** listener y **sin** pillar el PID del python.
 
-## Callejones y notas
+## Callejones
 
 - Tratar `:3128` como sitio web: solo el error page de Squid. Cerrado como origen.
 - `8080/tcp closed` desde el atacante: no es evidencia de que no haya HTTP interno.
-- CGI `/cgi-bin/status` / Shellshock: superficie plausible en Precise; no fue el foothold de estas notas. Escribible por `www-data` = persistencia web, no privesc.
+- CGI `/cgi-bin/status` / Shellshock: superficie plausible en Precise; no fue el foothold. Escribible por `www-data` = persistencia web, no privesc.
 - UDF MySQL: descartado a propósito; el cron ya era writer root. Además `mysqld` no es uid 0.
 - Kernel `3.11.0-15-generic` / Dirty COW y familia: reserva. Hay `gcc` en el box. No era el fallo que el autor plantó.
 - El panel admin se descubre por un txt en `/docs`, no por “intuición CMS”. Los leftovers de documentación son superficie.
 - `umask 0000` de la sesión `www-data` solo afecta ficheros *nuevos*. Un overwrite in-place conserva el modo del inode original.
-- Las imágenes originales de Joplin y el `-oN` del Nmap no están en este repo. Cuando se reexporten: `labs/sickos-1.1/img/` y el scan junto a la tabla de puertos.
-
-## Lectura (mecanismo, no receta)
-
-- [crontab(5)](https://man7.org/linux/man-pages/man5/crontab.5.html) — cinco campos + user en `/etc/cron.d`.
-- [HackTricks — Linux PE](https://book.hacktricks.wiki/en/linux-hardening/privilege-escalation/index.html) — sección scheduled/cron; quedarse en *writable script*, ignorar PATH/wildcard en la primera pasada.
-- [PayloadsAllTheThings — Linux PE](https://github.com/swisskyrepo/PayloadsAllTheThings/blob/master/Methodology%20and%20Resources/Linux%20-%20Privilege%20Escalation.md) — checklist de enumeración.
-- [pspy](https://github.com/DominicBreuker/pspy) — ver el tick `CRON` → `python` sin ser root.
-- MITRE [T1053.003](https://attack.mitre.org/techniques/T1053/003/).
-
-## Qué deberías poder explicar sin mirar el writeup
-
-- Por qué un forward proxy cambia lo que “existe” en HTTP, y por qué el error page de Squid no es la app.
-- Por qué `8080 closed` y “solo GET/HEAD” cambian lo que puedes asumir del pivot.
-- Por qué un file manager autenticado + document root = RCE, aunque no haya CVE con logo.
-- Por qué CGI + Bash de Precise es otra hipótesis distinta (y por qué aquí no se usó).
-- Por qué un cron no es privesc hasta que el archivo ejecutado es writable por un uid inferior.
-- Por qué esta caja es *overwrite de script* y no PATH hijack ni wildcard.
-- Por qué el runtime es Python 2.7 aunque el shebang “diga otra cosa”, y dónde se ve un `SyntaxError` de cron.
-- Por qué un drop-in en `sudoers.d` con modo distinto de `0440` “no existe” para `sudo`.
-- Por qué `secure_file_priv` no es el único bit que decide un UDF.
-- Por qué reusar el secreto del DSN contra `sickos` no es un bug de MySQL.
